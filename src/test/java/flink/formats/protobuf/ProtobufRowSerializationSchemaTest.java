@@ -30,10 +30,10 @@ public class ProtobufRowSerializationSchemaTest {
     private Row r;
 
     private static final String PROTO_DESCRIPTOR_FILE_GENERATOR_CMD =
-            "protoc --proto_path ./src/main/proto --descriptor_set_out=./person.desc ./src/main/proto/person.proto";
+            "protoc --proto_path ./src/test/proto --descriptor_set_out=./person.desc ./src/test/proto/person.proto";
 
     private static final String PROTO_JAVA_FILE_GENERATOR_CMD =
-            "protoc --proto_path ./src/main/proto --java_out=./ ./src/main/proto/person.proto";
+            "protoc --proto_path ./src/test/proto --java_out=./ ./src/test/proto/person.proto";
 
     @Before
     public void initPerson() throws IOException, InterruptedException {
