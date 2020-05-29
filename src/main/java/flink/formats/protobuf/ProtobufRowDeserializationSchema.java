@@ -4,15 +4,16 @@ package flink.formats.protobuf;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.Serializable;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.TimeZone;
 import java.util.stream.Collectors;
 
@@ -31,12 +32,12 @@ import org.joda.time.LocalTime;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Descriptors;
+import com.google.protobuf.Descriptors.FieldDescriptor;
 import com.google.protobuf.DynamicMessage;
 import com.google.protobuf.GeneratedMessageV3;
 import com.google.protobuf.MapEntry;
 import com.google.protobuf.Message;
 
-import flink.MoreSuppliers;
 import flink.formats.protobuf.typeutils.ProtobufSchemaConverter;
 
 public class ProtobufRowDeserializationSchema extends AbstractDeserializationSchema<Row> {
@@ -70,6 +71,13 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
      */
     private transient Message defaultInstance;
 
+    private transient DeserializationRuntimeConverter deserializationRuntimeConverter;
+
+    @FunctionalInterface
+    interface DeserializationRuntimeConverter extends Serializable {
+        Object convert(Object object);
+    }
+
     /**
      * Creates a Protobuf deserialization descriptor for the given message class. Having the
      * concrete Protobuf message class might improve performance.
@@ -83,6 +91,7 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
         this.descriptor = ProtobufUtils.getDescriptor(messageClazz);
         this.typeInfo = (RowTypeInfo) ProtobufSchemaConverter.convertToTypeInfo(messageClazz);
         this.defaultInstance = ProtobufUtils.getDefaultInstance(messageClazz);
+        this.deserializationRuntimeConverter = this.createRowConverter(this.descriptor, this.typeInfo);
     }
 
     /**
@@ -97,6 +106,7 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
         this.descriptor = ProtobufUtils.getDescriptor(descriptorBytes);
         this.typeInfo = (RowTypeInfo) ProtobufSchemaConverter.convertToTypeInfo(this.descriptor);
         this.defaultInstance = DynamicMessage.newBuilder(this.descriptor).getDefaultInstanceForType();
+        this.deserializationRuntimeConverter = createRowConverter(this.descriptor, this.typeInfo);
     }
 
     @Override
@@ -106,7 +116,7 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
                     .newBuilderForType()
                     .mergeFrom(bytes)
                     .build();
-            return convertProtobufMessageToRow(message, this.typeInfo);
+            return (Row) this.deserializationRuntimeConverter.convert(message);
         } catch (Exception e) {
             throw new IOException("Failed to deserialize Protobuf message.", e);
         }
@@ -119,30 +129,40 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
 
     // --------------------------------------------------------------------------------------------
 
-    private Row convertProtobufMessageToRow(Message message, RowTypeInfo rowTypeInfo) {
-        final List<Descriptors.FieldDescriptor> fields = message.getDescriptorForType().getFields();
-        final TypeInformation<?>[] fieldTypes = rowTypeInfo.getFieldTypes();
-        final int length = fields.size();
-        final Row row = new Row(length);
+    private DeserializationRuntimeConverter createRowConverter(Descriptors.Descriptor descriptor, RowTypeInfo rowTypeInfo) {
+        final Descriptors.FieldDescriptor[] fieldDescriptors =
+                descriptor.getFields().toArray(new FieldDescriptor[0]);
+        final TypeInformation<?>[] fieldTypeInfos = rowTypeInfo.getFieldTypes();
+
+        final int length = fieldDescriptors.length;
+
+        final DeserializationRuntimeConverter[] deserializationRuntimeConverters = new DeserializationRuntimeConverter[length];
+
         for (int i = 0; i < length; i++) {
-            final Descriptors.FieldDescriptor field = fields.get(i);
-            row.setField(i, convertProtobufTypeToRowType(field, fieldTypes[i], message.getField(field)));
+            final Descriptors.FieldDescriptor fieldDescriptor = fieldDescriptors[i];
+            final TypeInformation<?> fieldTypeInfo = fieldTypeInfos[i];
+            deserializationRuntimeConverters[i] = createConverter(fieldDescriptor, fieldTypeInfo);
         }
-        return row;
+
+        return (Object o) -> {
+            Message message = (Message) o;
+            final Row row = new Row(length);
+            for (int i = 0; i < length; i++) {
+                Object fieldO = message.getField(fieldDescriptors[i]);
+                row.setField(i, deserializationRuntimeConverters[i].convert(fieldO));
+            }
+            return row;
+        };
     }
 
     @SuppressWarnings("unchecked")
-    private Object convertProtobufTypeToRowType(Descriptors.GenericDescriptor genericDescriptor, TypeInformation<?> info, Object object) {
+    private DeserializationRuntimeConverter createConverter(Descriptors.GenericDescriptor genericDescriptor, TypeInformation<?> info) {
         // we perform the conversion based on descriptor information but enriched with pre-computed
         // type information where useful (i.e., for list)
 
-        if (object == null) {
-            return null;
-        }
-
         if (genericDescriptor instanceof Descriptors.Descriptor) {
 
-            return convertProtobufMessageToRow((Message) object, (RowTypeInfo) info);
+            return createRowConverter((Descriptors.Descriptor) genericDescriptor, (RowTypeInfo) info);
 
         } else if (genericDescriptor instanceof Descriptors.FieldDescriptor) {
 
@@ -155,132 +175,157 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
                 case UINT32:
                 case SFIXED32:
                 case SINT32:
-                    if (info instanceof ListTypeInfo) {
-                        // list
-                        TypeInformation<?> elementTypeInfo = ((ListTypeInfo) info).getElementTypeInfo();
-
-                        if (Types.SQL_DATE == elementTypeInfo) {
-                            return new ArrayList<>(((List<?>) object))
-                                    .stream()
-                                    .map(this::convertToDate)
-                                    .collect(Collectors.toList());
-                        } else if (Types.SQL_TIME == info) {
-                            return new ArrayList<>(((List<?>) object))
-                                    .stream()
-                                    .map(this::convertToTime)
-                                    .collect(Collectors.toList());
-                        } else {
-                            return new ArrayList<>(((List<?>) object));
-                        }
-                    } else {
-                        if (Types.SQL_DATE == info) {
-                            return convertToDate(object);
-                        } else if (Types.SQL_TIME == info) {
-                            return convertToTime(object);
-                        } else {
-
-                            return object;
-                        }
-                    }
                 case INT64:
                 case UINT64:
                 case FIXED64:
                 case SFIXED64:
                 case SINT64:
+                case DOUBLE:
+                case FLOAT:
+                case BOOL:
+                case STRING:
                     if (info instanceof ListTypeInfo) {
                         // list
                         TypeInformation<?> elementTypeInfo = ((ListTypeInfo) info).getElementTypeInfo();
 
-                        if (Types.SQL_TIMESTAMP == elementTypeInfo) {
-                            return new ArrayList<>(((List<?>) object))
-                                    .stream()
-                                    .map(this::convertToTimestamp)
-                                    .collect(Collectors.toList());
-                        } else {
-                            return new ArrayList<>(((List<?>) object));
-                        }
+                        return this.createListConverter(elementTypeInfo);
                     } else {
-                        if (Types.SQL_TIMESTAMP == info) {
-                            return convertToTimestamp(object);
-                        } else {
-                            return object;
-                        }
+                        return this.createObjectConverter(info);
                     }
-                case DOUBLE:
-                case FLOAT:
-                case BOOL:
-                    if (info instanceof ListTypeInfo) {
-                        // list
-                        return new ArrayList<>((List<?>) object);
-                    } else {
-                        return object;
-                    }
-                case STRING:
                 case ENUM:
                     if (info instanceof ListTypeInfo) {
                         // list
-                        return new ArrayList<>((List<?>) object)
+                        return (Object o) -> ((List) o)
                                 .stream()
                                 .map(Object::toString)
                                 .collect(Collectors.toList());
                     } else {
-                        return object.toString();
+                        return Object::toString;
                     }
                 case GROUP:
                 case MESSAGE:
                     if (info instanceof ListTypeInfo) {
                         // list
-                        final List<?> elements = (List<?>) object;
-
-                        final List<Object> convertedElements = new ArrayList<>(elements.size());
                         TypeInformation<?> elementTypeInfo = ((ListTypeInfo) info).getElementTypeInfo();
-                        for (Object element : elements) {
-                            convertedElements.add(convertProtobufTypeToRowType(fieldDescriptor.getMessageType(), elementTypeInfo, element));
-                        }
-                        return convertedElements;
+                        Descriptors.Descriptor elementDescriptor = fieldDescriptor.getMessageType();
+
+                        DeserializationRuntimeConverter elementConverter = this.createConverter(elementDescriptor, elementTypeInfo);
+
+                        return (Object o) -> ((List) o)
+                                .stream()
+                                .map(elementConverter::convert)
+                                .collect(Collectors.toList());
+
                     } else if (info instanceof MapTypeInfo) {
-                        // map todo map的key暂时只支持string
+                        // map
                         final MapTypeInfo<?, ?> mapTypeInfo = (MapTypeInfo<?, ?>) info;
-                        final Map<String, Object> convertedMap = new HashMap<>();
-                        final List<Message> mapList = (List<Message>) object;
 
-                        for (Message entry : mapList) {
-                            if (entry instanceof MapEntry) {
-                                convertedMap.put(
-                                        ((MapEntry) entry).getKey().toString(),
-                                        convertProtobufTypeToRowType(fieldDescriptor.getMessageType().getFields().get(1)
-                                                , mapTypeInfo.getValueTypeInfo()
-                                                , ((MapEntry) entry).getValue()));
-                            } else if (entry instanceof DynamicMessage) {
-                                DynamicMessage dynamicMessage = (DynamicMessage) entry;
-                                Object key = dynamicMessage.getField(fieldDescriptor.getMessageType().getFields().get(0));
-                                Object value = dynamicMessage.getField(fieldDescriptor.getMessageType().getFields().get(1));
+                        boolean isDynamicMessage = false;
 
-                                convertedMap.put(
-                                        key.toString(),
-                                        convertProtobufTypeToRowType(fieldDescriptor.getMessageType().getFields().get(1)
-                                                , mapTypeInfo.getValueTypeInfo()
-                                                , value));
-                            }
+                        if (this.messageClazz == null) {
+                            isDynamicMessage = true;
                         }
-                        return convertedMap;
+
+                        // todo map's key only support string
+                        final DeserializationRuntimeConverter keyConverter = Object::toString;
+
+                        final Descriptors.FieldDescriptor keyFieldDescriptor =
+                                fieldDescriptor.getMessageType().getFields().get(0);
+
+                        final Descriptors.FieldDescriptor valueFieldDescriptor =
+                                fieldDescriptor.getMessageType().getFields().get(1);
+
+                        final TypeInformation<?> valueTypeInfo =
+                                mapTypeInfo.getValueTypeInfo();
+
+                        final DeserializationRuntimeConverter valueConverter =
+                                createConverter(valueFieldDescriptor, valueTypeInfo);
+
+                        if (isDynamicMessage) {
+
+                            return (Object o) -> {
+                                final List<DynamicMessage> dynamicMessages = (List<DynamicMessage>) o;
+
+                                final Map<String, Object> convertedMap = new HashMap<>(dynamicMessages.size());
+
+                                dynamicMessages.forEach((DynamicMessage dynamicMessage) -> {
+                                    convertedMap.put(
+                                            (String) keyConverter.convert(dynamicMessage.getField(keyFieldDescriptor))
+                                            , valueConverter.convert(dynamicMessage.getField(valueFieldDescriptor)));
+                                });
+
+                                return convertedMap;
+                            };
+
+                        } else {
+
+                            return (Object o) -> {
+                                final List<MapEntry> mapEntryList = (List<MapEntry>) o;
+                                final Map<String, Object> convertedMap = new HashMap<>(mapEntryList.size());
+                                mapEntryList.forEach((MapEntry message) -> {
+                                    convertedMap.put(
+                                            (String) keyConverter.convert(message.getKey())
+                                            , valueConverter.convert(message.getValue()));
+                                });
+
+                                return convertedMap;
+                            };
+                        }
                     } else if (info instanceof RowTypeInfo) {
                         // row
-                        return convertProtobufMessageToRow((Message) object, (RowTypeInfo) info);
+                        return createRowConverter(((FieldDescriptor) genericDescriptor).getMessageType(), (RowTypeInfo) info);
                     }
-                    throw new IllegalStateException("Message expected but was: " + object.getClass());
+                    throw new IllegalStateException("Message expected but was: ");
                 case BYTES:
-                    final byte[] bytes = ((ByteString) object).toByteArray();
-                    if (Types.BIG_DEC == info) {
-                        return convertToDecimal(bytes);
-                    }
-                    return bytes;
+
+                    return (Object o) -> {
+                        final byte[] bytes = ((ByteString) o).toByteArray();
+                        if (Types.BIG_DEC == info) {
+                            return convertToDecimal(bytes);
+                        }
+                        return bytes;
+                    };
             }
         }
 
         throw new IllegalArgumentException("Unsupported Protobuf type '" + genericDescriptor.getName() + "'.");
 
     }
+
+    @SuppressWarnings("unchecked")
+    private DeserializationRuntimeConverter createListConverter(TypeInformation<?> info) {
+
+        DeserializationRuntimeConverter elementConverter;
+
+        if (Types.SQL_DATE == info) {
+
+            elementConverter = this::convertToDate;
+
+        } else if (Types.SQL_TIME == info) {
+
+            elementConverter = this::convertToTime;
+        } else {
+
+            elementConverter = (Object fieldO) -> (fieldO);
+        }
+
+        return (Object o) -> ((List) o)
+                .stream()
+                .map(elementConverter::convert)
+                .collect(Collectors.toList());
+    }
+
+    private DeserializationRuntimeConverter createObjectConverter(TypeInformation<?> info) {
+        if (Types.SQL_DATE == info) {
+            return this::convertToDate;
+        } else if (Types.SQL_TIME == info) {
+            return this::convertToTime;
+        } else {
+            return (Object o) -> o;
+        }
+    }
+
+    // --------------------------------------------------------------------------------------------
 
     private BigDecimal convertToDecimal(byte[] bytes) {
         return new BigDecimal(new BigInteger(bytes));
@@ -326,22 +371,29 @@ public class ProtobufRowDeserializationSchema extends AbstractDeserializationSch
     }
 
     private void writeObject(ObjectOutputStream outputStream) throws IOException {
-        outputStream.writeObject(this.messageClazz);
-        outputStream.write(this.descriptorBytes);
+        if (Objects.nonNull(this.messageClazz)) {
+            outputStream.writeObject(this.messageClazz);
+        } else {
+            outputStream.writeObject(this.descriptorBytes);
+        }
     }
 
     @SuppressWarnings("unchecked")
     private void readObject(ObjectInputStream inputStream) throws ClassNotFoundException, IOException {
-        this.messageClazz = (Class<? extends Message>) inputStream.readObject();
-        this.descriptorBytes = MoreSuppliers.throwing(() -> ProtobufUtils.getBytes(inputStream));
-        if (null != this.descriptorBytes) {
-            this.descriptor = ProtobufUtils.getDescriptor(this.descriptorBytes);
-            this.typeInfo = (RowTypeInfo) ProtobufSchemaConverter.convertToTypeInfo(this.descriptor);
-            this.defaultInstance = DynamicMessage.newBuilder(this.descriptor).getDefaultInstanceForType();
-        } else {
+
+        Object o = inputStream.readObject();
+
+        if (o instanceof Class) {
+            this.messageClazz = (Class<? extends Message>) o;
             this.descriptor = ProtobufUtils.getDescriptor(this.messageClazz);
             this.typeInfo = (RowTypeInfo) ProtobufSchemaConverter.convertToTypeInfo(this.messageClazz);
             this.defaultInstance = ProtobufUtils.getDefaultInstance(this.messageClazz);
+        } else {
+            this.descriptorBytes = (byte[]) o;
+            this.descriptor = ProtobufUtils.getDescriptor(this.descriptorBytes);
+            this.typeInfo = (RowTypeInfo) ProtobufSchemaConverter.convertToTypeInfo(this.descriptor);
+            this.defaultInstance = DynamicMessage.newBuilder(this.descriptor).getDefaultInstanceForType();
         }
+        this.deserializationRuntimeConverter = this.createConverter(this.descriptor, this.typeInfo);
     }
 }

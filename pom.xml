@@ -135,15 +135,6 @@
             </extension>
         </extensions>
 
-        <resources>
-            <resource>
-                <directory>src/main/java/</directory>
-            </resource>
-            <resource>
-                <directory>src/main/resources/</directory>
-            </resource>
-        </resources>
-
         <plugins>
 
             <plugin>
@@ -160,6 +151,9 @@
                 <artifactId>protobuf-maven-plugin</artifactId>
                 <version>${protobuf-maven-plugin.version}</version>
                 <configuration>
+                    <protoSourceRoot>
+                        src/test/proto
+                    </protoSourceRoot>
                     <protocArtifact>
                         com.google.protobuf:protoc:3.1.0:exe:${os.detected.classifier}
                     </protocArtifact>
