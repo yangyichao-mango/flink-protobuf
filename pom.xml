@@ -19,7 +19,7 @@
 
         <joda-time.version>2.5</joda-time.version>
 
-        <flink.version>1.8.1</flink.version>
+        <flink.version>1.12.0</flink.version>
     </properties>
 
     <dependencies>
