@@ -13,7 +13,7 @@
 
         <grpc-plugin.version>1.23.1</grpc-plugin.version>
         <protobuf-maven-plugin.version>0.6.1</protobuf-maven-plugin.version>
-        <protobuf-java.version>3.11.0</protobuf-java.version>
+        <protobuf-java.version>3.16.3</protobuf-java.version>
 
         <scala.binary.version>2.11</scala.binary.version>
 
